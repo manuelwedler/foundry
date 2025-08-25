@@ -413,6 +413,7 @@ impl CreateArgs {
         };
 
         let verify = VerifyArgs {
+            // todo pass transaction hash
             address,
             contract: Some(self.contract),
             compiler_version: Some(id.version.to_string()),

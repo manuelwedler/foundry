@@ -1,15 +1,19 @@
 use crate::{
     provider::{VerificationContext, VerificationProvider},
-    verify::{VerifyArgs, VerifyCheckArgs},
+    retry::RETRY_CHECK_ON_VERIFY,
+    utils::ensure_solc_build_metadata,
+    verify::{ContractLanguage, VerifyArgs, VerifyCheckArgs},
 };
-use alloy_primitives::map::HashMap;
 use async_trait::async_trait;
-use eyre::Result;
-use foundry_common::fs;
+use eyre::{Context, Result, eyre};
+use foundry_common::retry::RetryError;
+use foundry_compilers::{
+    artifacts::{Source, StandardJsonCompilerInput, vyper::VyperInput},
+    solc::SolcLanguage,
+};
 use futures::FutureExt;
-use reqwest::Url;
 use serde::{Deserialize, Serialize};
-use std::str::FromStr;
+use std::path::Path;
 
 pub static SOURCIFY_URL: &str = "https://sourcify.dev/server/";
 
@@ -25,16 +29,19 @@ impl VerificationProvider for SourcifyVerificationProvider {
         args: VerifyArgs,
         context: VerificationContext,
     ) -> Result<()> {
-        let _ = self.prepare_request(&args, &context)?;
+        let _ = self.prepare_verify_request(&args, &context).await?;
         Ok(())
     }
 
     async fn verify(&mut self, args: VerifyArgs, context: VerificationContext) -> Result<()> {
-        let body = self.prepare_request(&args, &context)?;
+        let body = self.prepare_verify_request(&args, &context).await?;
+        let chain_id = args.etherscan.chain.unwrap_or_default().id();
 
         trace!("submitting verification request {:?}", body);
 
         let client = reqwest::Client::new();
+        let base_url = args.verifier.verifier_url.as_deref().unwrap_or(SOURCIFY_URL);
+        let url = format!("{}v2/verify/{}/{}", base_url, chain_id, args.address);
 
         let resp = args
             .retry
@@ -47,155 +54,269 @@ impl VerificationProvider for SourcifyVerificationProvider {
                         args.address.to_string()
                     )?;
                     let response = client
-                        .post(args.verifier.verifier_url.as_deref().unwrap_or(SOURCIFY_URL))
+                        .post(&url)
                         .header("Content-Type", "application/json")
                         .body(serde_json::to_string(&body)?)
                         .send()
                         .await?;
 
                     let status = response.status();
-                    if !status.is_success() {
-                        let error: serde_json::Value = response.json().await?;
-                        eyre::bail!(
-                            "Sourcify verification request for address ({}) \
-                             failed with status code {status}\n\
-                             Details: {error:#}",
-                            args.address,
-                        );
+
+                    if status == 409 {
+                        sh_println!("Contract source code already fully verified")?;
+                        return Ok(None);
                     }
 
-                    let text = response.text().await?;
-                    Ok(Some(serde_json::from_str::<SourcifyVerificationResponse>(&text)?))
+                    if status == 202 {
+                        let text = response.text().await?;
+                        let verify_response: SourcifyVerificationResponse =
+                            serde_json::from_str(&text)
+                                .wrap_err("Failed to parse Sourcify verification response")?;
+                        return Ok(Some(verify_response));
+                    }
+
+                    let error: serde_json::Value = response.json().await?;
+                    eyre::bail!(
+                        "Sourcify verification request for address ({}) \
+                            failed with status code {status}\n\
+                            Details: {error:#}",
+                        args.address,
+                    );
                 }
                 .boxed()
             })
             .await?;
 
-        self.process_sourcify_response(resp.map(|r| r.result))
+        if let Some(resp) = resp {
+            let job_url = format!("{}v2/verify/{}", base_url, resp.verification_id);
+            sh_println!(
+                "Submitted contract for verification:\n\tVerification ID: `{}`\n\tURL: {}",
+                resp.verification_id,
+                job_url
+            )?;
+
+            if args.watch {
+                let check_args = VerifyCheckArgs {
+                    id: resp.verification_id,
+                    etherscan: args.etherscan,
+                    retry: RETRY_CHECK_ON_VERIFY,
+                    verifier: args.verifier,
+                };
+                return self.check(check_args).await;
+            }
+        }
+
+        Ok(())
     }
 
     async fn check(&self, args: VerifyCheckArgs) -> Result<()> {
-        let resp = args
-            .retry
+        let base_url = args.verifier.verifier_url.as_deref().unwrap_or(SOURCIFY_URL);
+        let url = format!("{}v2/verify/{}", base_url, args.id);
+
+        args.retry
             .into_retry()
-            .run_async(|| {
-                async {
-                    let url = Url::from_str(
-                        args.verifier.verifier_url.as_deref().unwrap_or(SOURCIFY_URL),
-                    )?;
-                    let query = format!(
-                        "check-by-addresses?addresses={}&chainIds={}",
-                        args.id,
-                        args.etherscan.chain.unwrap_or_default().id(),
-                    );
-                    let url = url.join(&query)?;
-                    let response = reqwest::get(url).await?;
-                    if !response.status().is_success() {
-                        eyre::bail!(
-                            "Failed to request verification status with status code {}",
-                            response.status()
-                        );
-                    };
+            .run_async_until_break(|| async {
+                let response = reqwest::get(&url)
+                    .await
+                    .wrap_err("Failed to request verification status")
+                    .map_err(RetryError::Retry)?;
 
-                    Ok(Some(response.json::<Vec<SourcifyResponseElement>>().await?))
+                if response.status() == 404 {
+                    return Err(RetryError::Break(eyre!(
+                        "No verification job found for ID {}",
+                        args.id
+                    )));
                 }
-                .boxed()
-            })
-            .await?;
 
-        self.process_sourcify_response(resp)
+                if !response.status().is_success() {
+                    return Err(RetryError::Retry(eyre!(
+                        "Failed to request verification status with status code {}",
+                        response.status()
+                    )));
+                }
+
+                let job_response: SourcifyJobResponse = response
+                    .json()
+                    .await
+                    .wrap_err("Failed to parse job response")
+                    .map_err(RetryError::Retry)?;
+
+                if !job_response.is_job_completed {
+                    return Err(RetryError::Retry(eyre!("Verification is still pending...")));
+                }
+
+                if let Some(error) = job_response.error {
+                    if error.custom_code == "already_verified" {
+                        let _ = sh_println!("Contract source code already verified");
+                        return Ok(());
+                    }
+
+                    return Err(RetryError::Break(eyre!(
+                        "Verification job failed:\nError Code: `{}`\nMessage: `{}`",
+                        error.custom_code,
+                        error.message
+                    )));
+                }
+
+                if let Some(contract_status) = job_response.contract.match_status {
+                    let _ = sh_println!(
+                        "Contract successfully verified:\nStatus: `{}`",
+                        contract_status,
+                    );
+                }
+                Ok(())
+            })
+            .await
+            .wrap_err("Checking verification result failed")
     }
 }
 
 impl SourcifyVerificationProvider {
     /// Configures the API request to the sourcify API using the given [`VerifyArgs`].
-    fn prepare_request(
+    async fn prepare_verify_request(
         &self,
         args: &VerifyArgs,
         context: &VerificationContext,
     ) -> Result<SourcifyVerifyRequest> {
-        let metadata = context.get_target_metadata()?;
-        let imports = context.get_target_imports()?;
+        let lang = args.detect_language(context);
 
-        let mut files = HashMap::with_capacity_and_hasher(2 + imports.len(), Default::default());
+        let std_json_input = match lang {
+            ContractLanguage::Solidity => {
+                let mut input: StandardJsonCompilerInput = context
+                    .project
+                    .standard_json_input(&context.target_path)
+                    .wrap_err("Failed to get standard json input")?
+                    .normalize_evm_version(&context.compiler_version);
 
-        let metadata = serde_json::to_string_pretty(&metadata)?;
-        files.insert("metadata.json".to_string(), metadata);
+                let mut settings = context.compiler_settings.solc.settings.clone();
+                settings.libraries.libs = input
+                    .settings
+                    .libraries
+                    .libs
+                    .into_iter()
+                    .map(|(f, libs)| {
+                        (f.strip_prefix(context.project.root()).unwrap_or(&f).to_path_buf(), libs)
+                    })
+                    .collect();
 
-        let contract_path = context.target_path.clone();
-        let filename = contract_path.file_name().unwrap().to_string_lossy().to_string();
-        files.insert(filename, fs::read_to_string(&contract_path)?);
+                settings.remappings = input.settings.remappings;
 
-        for import in imports {
-            let import_entry = format!("{}", import.display());
-            files.insert(import_entry, fs::read_to_string(&import)?);
-        }
+                // remove all incompatible settings
+                settings.sanitize(&context.compiler_version, SolcLanguage::Solidity);
+
+                input.settings = settings;
+
+                serde_json::to_value(&input).wrap_err("Failed to serialize standard json input")?
+            }
+            ContractLanguage::Vyper => {
+                let path = Path::new(&context.target_path);
+                let sources = Source::read_all_from(path, &["vy", "vyi"])?;
+                let input = VyperInput::new(
+                    sources,
+                    context.clone().compiler_settings.vyper,
+                    &context.compiler_version,
+                );
+
+                serde_json::to_value(&input).wrap_err("Failed to serialize vyper json input")?
+            }
+        };
+
+        let contract_identifier = format!(
+            "{}:{}",
+            context
+                .target_path
+                .strip_prefix(context.project.root())
+                .unwrap_or(context.target_path.as_path())
+                .display(),
+            context.target_name
+        );
+
+        let compiler_version = if matches!(lang, ContractLanguage::Vyper) {
+            context
+                .compiler_version
+                .clone()
+                .to_string()
+                .split('+')
+                .next()
+                .unwrap_or("0.0.0")
+                .to_string()
+        } else {
+            ensure_solc_build_metadata(context.compiler_version.clone()).await?.to_string()
+        };
 
         let req = SourcifyVerifyRequest {
-            address: args.address.to_string(),
-            chain: args.etherscan.chain.unwrap_or_default().id().to_string(),
-            files,
-            chosen_contract: None,
+            std_json_input,
+            compiler_version,
+            contract_identifier,
+            creation_transaction_hash: None, // Could be added as an option later
         };
 
         Ok(req)
-    }
-
-    fn process_sourcify_response(
-        &self,
-        response: Option<Vec<SourcifyResponseElement>>,
-    ) -> Result<()> {
-        let Some([response, ..]) = response.as_deref() else { return Ok(()) };
-        match response.status.as_str() {
-            "perfect" => {
-                if let Some(ts) = &response.storage_timestamp {
-                    sh_println!("Contract source code already verified. Storage Timestamp: {ts}")?;
-                } else {
-                    sh_println!("Contract successfully verified")?;
-                }
-            }
-            "partial" => {
-                sh_println!("The recompiled contract partially matches the deployed version")?;
-            }
-            "false" => sh_println!("Contract source code is not verified")?,
-            s => eyre::bail!("Unknown status from sourcify. Status: {s:?}"),
-        }
-        Ok(())
     }
 }
 
 #[derive(Debug, Serialize)]
 pub struct SourcifyVerifyRequest {
-    address: String,
-    chain: String,
-    files: HashMap<String, String>,
-    #[serde(rename = "chosenContract", skip_serializing_if = "Option::is_none")]
-    chosen_contract: Option<String>,
+    #[serde(rename = "stdJsonInput")]
+    std_json_input: serde_json::Value,
+    #[serde(rename = "compilerVersion")]
+    compiler_version: String,
+    #[serde(rename = "contractIdentifier")]
+    contract_identifier: String,
+    #[serde(rename = "creationTransactionHash", skip_serializing_if = "Option::is_none")]
+    creation_transaction_hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct SourcifyVerificationResponse {
-    result: Vec<SourcifyResponseElement>,
+    #[serde(rename = "verificationId")]
+    verification_id: String,
 }
 
 #[derive(Debug, Deserialize)]
-pub struct SourcifyResponseElement {
-    status: String,
-    #[serde(rename = "storageTimestamp")]
-    storage_timestamp: Option<String>,
+pub struct SourcifyJobResponse {
+    #[serde(rename = "isJobCompleted")]
+    is_job_completed: bool,
+    contract: SourcifyContractResponse,
+    error: Option<SourcifyErrorResponse>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SourcifyContractResponse {
+    #[serde(rename = "match")]
+    match_status: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SourcifyErrorResponse {
+    #[serde(rename = "customCode")]
+    custom_code: String,
+    message: String,
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
 
     #[test]
-    fn test_check_addresses_url() {
-        let url = Url::from_str("https://server-verify.hashscan.io").unwrap();
-        let url = url.join("check-by-addresses?addresses=0x1234&chainIds=1").unwrap();
+    fn test_verify_url() {
+        let base_url = "https://sourcify.dev/server/";
+        let chain_id = 1;
+        let address = "0x1234567890123456789012345678901234567890";
+        let url = format!("{base_url}v2/verify/{chain_id}/{address}");
         assert_eq!(
-            url.as_str(),
-            "https://server-verify.hashscan.io/check-by-addresses?addresses=0x1234&chainIds=1"
+            url,
+            "https://sourcify.dev/server/v2/verify/1/0x1234567890123456789012345678901234567890"
+        );
+    }
+
+    #[test]
+    fn test_status_url() {
+        let base_url = "https://sourcify.dev/server/";
+        let verification_id = "550e8400-e29b-41d4-a716-446655440000";
+        let url = format!("{base_url}v2/verify/{verification_id}");
+        assert_eq!(
+            url,
+            "https://sourcify.dev/server/v2/verify/550e8400-e29b-41d4-a716-446655440000"
         );
     }
 }
