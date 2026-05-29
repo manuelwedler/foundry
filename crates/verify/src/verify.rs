@@ -4,6 +4,7 @@ use crate::{
     RetryArgs,
     etherscan::EtherscanVerificationProvider,
     provider::{VerificationContext, VerificationProvider, VerificationProviderType},
+    sourcify::SourcifyVerificationProvider,
     utils::wrap_verifier_url_error,
 };
 use alloy_primitives::{Address, TxHash, map::HashSet};
@@ -222,6 +223,14 @@ impl figment::Provider for VerifyArgs {
     }
 }
 
+struct ProviderRun {
+    label: VerificationProviderType,
+    args: VerifyArgs,
+    provider: Box<dyn VerificationProvider>,
+    /// If true, a failed run fails the command; otherwise the failure is logged as a warning.
+    required: bool,
+}
+
 impl VerifyArgs {
     /// Run the verify command to submit the contract's source code for verification on etherscan
     pub async fn run(mut self) -> Result<()> {
@@ -293,16 +302,72 @@ impl VerifyArgs {
                         | VerificationProviderType::Oklink
                         | VerificationProviderType::Custom
                 ));
-        self.verifier
-            .verifier
-            .client(
-                etherscan_key.as_deref(),
-                self.etherscan.chain,
-                self.verifier.verifier_url.is_some(),
-            )?
-            .verify(self, context)
-            .await
-            .map_err(|err| wrap_verifier_url_error(err, verifier_url.as_deref(), using_etherscan))
+
+        let runs = self.collect_runs(chain, etherscan_key.as_deref())?;
+
+        let futs = runs.into_iter().map(|ProviderRun { label, args, mut provider, required }| {
+            let ctx = context.clone();
+            async move {
+                let res = provider.verify(args, ctx).await;
+                (label, required, res)
+            }
+        });
+        let results = futures::future::join_all(futs).await;
+
+        let mut required_err = None;
+        for (label, required, res) in results {
+            match (required, res) {
+                (true, Err(err)) => {
+                    required_err = Some(wrap_verifier_url_error(
+                        err,
+                        verifier_url.as_deref(),
+                        using_etherscan,
+                    ));
+                }
+                (false, Err(err)) => {
+                    sh_warn!("{label} verification failed: {err}")?;
+                }
+                _ => {}
+            }
+        }
+        if let Some(err) = required_err {
+            return Err(err);
+        }
+        Ok(())
+    }
+
+    /// Plans the set of verification submissions to run for this invocation.
+    fn collect_runs(&self, chain: Chain, etherscan_key: Option<&str>) -> Result<Vec<ProviderRun>> {
+        let mut runs = Vec::new();
+
+        let primary_provider = self.verifier.verifier.client(
+            etherscan_key,
+            self.etherscan.chain,
+            self.verifier.verifier_url.is_some(),
+        )?;
+        runs.push(ProviderRun {
+            label: self.verifier.verifier.clone(),
+            args: self.clone(),
+            provider: primary_provider,
+            required: true,
+        });
+
+        if !self.verifier.verifier.is_sourcify() {
+            let mut args = self.clone();
+            args.verifier.verifier = VerificationProviderType::Sourcify;
+            args.verifier.verifier_api_key = None;
+            // For chains with a Sourcify-compatible API registered in alloy-chains, use it.
+            // Otherwise, drop the primary verifier's URL so Sourcify falls back to its default.
+            args.verifier.verifier_url = sourcify_api_url(chain);
+            runs.push(ProviderRun {
+                label: VerificationProviderType::Sourcify,
+                args,
+                provider: Box::<SourcifyVerificationProvider>::default(),
+                required: false,
+            });
+        }
+
+        Ok(runs)
     }
 
     /// Returns the configured verification provider
